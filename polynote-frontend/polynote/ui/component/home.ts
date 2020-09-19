@@ -1,7 +1,7 @@
 "use strict";
 
-import {TriggerItem, UIMessage, UIMessageTarget} from "../util/ui_event";
-import {div, span, tag, TagElement} from "../util/tags";
+import {LoadNotebook, UIMessage, UIMessageTarget} from "../util/ui_event";
+import {div, polynoteLogo, span, tag, TagElement} from "../util/tags";
 import {storage} from "../util/storage";
 
 export class HomeUI extends UIMessageTarget {
@@ -10,23 +10,24 @@ export class HomeUI extends UIMessageTarget {
         super();
         this.el = div(['welcome-page'], []);
         this.el.innerHTML = `
-          <img src="/style/polynote.svg" alt="Polynote" />
           <h2>Home</h2>
           
           <p>
             To get started, open a notebook by clicking on it in the Notebooks panel, or create a new notebook by
-             clicking the Create Notebook (<span class="create-notebook icon fas"></span>) button.
+             clicking the Create Notebook (<span class="create-notebook icon fas"><img class="icon" src="static/style/icons/fa/plus-circle.svg"/></span>) button.
           </p>
           
           <h3>Recent notebooks</h3>
           <ul class="recent-notebooks"></ul>  
         `;
 
+        this.el.insertBefore(polynoteLogo(), this.el.firstChild);
+
         const recent = this.el.querySelector('.recent-notebooks');
-        (storage.get('recentNotebooks') || []).forEach((nb: {name: string, path: string}) => {
+        (storage.get('recentNotebooks') ?? []).forEach((nb: {name: string, path: string}) => {
             recent!.appendChild(
                 tag('li', ['notebook-link'], {}, [
-                    span([], nb.name).click(() => this.publish(new TriggerItem(nb.path)))
+                    span([], nb.name).click(() => this.publish(new LoadNotebook(nb.path)))
                 ])
             );
         });

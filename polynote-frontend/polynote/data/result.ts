@@ -5,13 +5,15 @@ import {
     str, shortStr, tinyStr, uint8, uint16, int32, ior, CodecContainer
 } from './codec'
 
-import {ValueRepr, StringRepr, MIMERepr, StreamingDataRepr, DataRepr, LazyDataRepr} from './value_repr'
+import {ValueRepr, StringRepr, MIMERepr, StreamingDataRepr, DataRepr, LazyDataRepr, DataStream} from './value_repr'
 import {int16, int64} from "./codec";
 import {Cell, CodeCell} from "../ui/component/cell";
 import {displayData, displaySchema} from "../ui/component/display_content";
 import {div, h4, iconButton, span} from "../ui/util/tags";
 import * as monaco from "monaco-editor";
 import {ValueInspector} from "../ui/component/value_inspector";
+import {StructType} from "./data_type";
+import {SocketSession} from "../comms";
 
 export class Result extends CodecContainer {
     static codec: Codec<Result>;
@@ -28,14 +30,14 @@ export class Result extends CodecContainer {
 }
 
 export class Output extends Result {
-    static codec = combined(str, str).to(Output);
+    static codec = combined(str, arrayCodec(int32, str)).to(Output);
     static get msgTypeId() { return 0; }
 
     static unapply(inst: Output): ConstructorParameters<typeof Output> {
         return [inst.contentType, inst.content];
     }
 
-    constructor(readonly contentType: string, readonly content: string) {
+    constructor(readonly contentType: string, readonly content: string[]) {
         super(contentType, content);
         Object.freeze(this);
     }
@@ -95,9 +97,9 @@ export class StackTraceElement {
 
 // maps to JVM Throwable
 // WARNING: not frozen (mutable)
-export class KernelError {
-    static codec = combined(str, str, arrayCodec(uint16, StackTraceElement.codec)).to(KernelError);
-    static unapply(inst: KernelError): ConstructorParameters<typeof KernelError> {
+export class ServerError {
+    static codec = combined(str, str, arrayCodec(uint16, StackTraceElement.codec)).to(ServerError);
+    static unapply(inst: ServerError): ConstructorParameters<typeof ServerError> {
         return [inst.className, inst.message, inst.stackTrace];
     }
 
@@ -118,28 +120,28 @@ export class KernelError {
     }
 }
 
-export class KernelErrorWithCause {
-    static codec = Codec.map<KernelError[], KernelErrorWithCause | null>(
-        arrayCodec(uint8, KernelError.codec),
-        (kernelErrors: KernelError[]) => {
+export class ServerErrorWithCause {
+    static codec = Codec.map<ServerError[], ServerErrorWithCause | null>(
+        arrayCodec(uint8, ServerError.codec),
+        (kernelErrors: ServerError[]) => {
             if (kernelErrors.length === 0) return null;
 
             let i = kernelErrors.length - 1;
-            let current = new KernelErrorWithCause(kernelErrors[i].className, kernelErrors[i].message, kernelErrors[i].stackTrace);
+            let current = new ServerErrorWithCause(kernelErrors[i].className, kernelErrors[i].message, kernelErrors[i].stackTrace);
 
             while (i > 0) {
                 const next = kernelErrors[--i];
-                current = new KernelErrorWithCause(next.className, next.message, next.stackTrace, current);
+                current = new ServerErrorWithCause(next.className, next.message, next.stackTrace, current);
             }
             return current;
         },
-        (withCause: KernelErrorWithCause | null) => {
+        (withCause: ServerErrorWithCause | null) => {
             if (withCause == null) return [];
             const errs = [];
-            let current: KernelErrorWithCause | undefined = withCause;
+            let current: ServerErrorWithCause | undefined = withCause;
             let i = 0;
             while (i < 16 && current != null) {
-                errs.push(new KernelError(current.className, current.message, current.stackTrace));
+                errs.push(new ServerError(current.className, current.message, current.stackTrace));
                 current = current.cause;
                 i++;
             }
@@ -147,30 +149,30 @@ export class KernelErrorWithCause {
             return errs;
         }
     );
-    static unapply(inst: KernelErrorWithCause): ConstructorParameters<typeof KernelErrorWithCause> {
+    static unapply(inst: ServerErrorWithCause): ConstructorParameters<typeof ServerErrorWithCause> {
         return [inst.className, inst.message, inst.stackTrace, inst.cause];
     }
 
-    constructor(readonly className: string, readonly message: string, readonly stackTrace: StackTraceElement[], readonly cause?: KernelErrorWithCause) {
+    constructor(readonly className: string, readonly message: string, readonly stackTrace: StackTraceElement[], readonly cause?: ServerErrorWithCause) {
         Object.freeze(this);
     }
 }
 
 
 export class RuntimeError extends Result {
-    static codec = combined(KernelErrorWithCause.codec).to(RuntimeError);
+    static codec = combined(ServerErrorWithCause.codec).to(RuntimeError);
     static get msgTypeId() { return 2; }
 
     static unapply(inst: RuntimeError): ConstructorParameters<typeof RuntimeError> {
         return [inst.error];
     }
 
-    constructor(readonly error: KernelErrorWithCause) {
+    constructor(readonly error: ServerErrorWithCause) {
         super();
         Object.freeze(this);
     }
 
-    static fromJS = (err: Error) => new RuntimeError(new KernelErrorWithCause(err.constructor.name, err.message || err.toString(), []));
+    static fromJS = (err: Error) => new RuntimeError(new ServerErrorWithCause(err.constructor.name, err.message || err.toString(), []));
 }
 
 export class ClearResults extends Result {
@@ -202,6 +204,23 @@ export class PosRange {
     constructor(readonly start: number, readonly end: number) {
         Object.freeze(this);
     }
+
+    get reversed() {
+        return new PosRange(this.end, this.start);
+    }
+
+    get asString() {
+        return `${this.start}-${this.end}`
+    }
+
+    equals(other: PosRange): Boolean {
+        return this.start === other.start && this.end === other.end
+    }
+
+    static fromString(serialized: string): PosRange {
+        const [start, end] = serialized.split("-");
+        return new PosRange(parseInt(start), parseInt(end));
+    }
 }
 
 
@@ -228,44 +247,14 @@ export class ResultValue extends Result {
      * Get a default MIME type and string, for display purposes
      */
     displayRepr(cell: CodeCell, valueInspector: ValueInspector): Promise<[string, string | DocumentFragment]> {
+        // We're searching for the best MIME type and representation for this result by going in order of most to least
+        // useful (kind of arbitrarily defined...)
         // TODO: make this smarter
-        let index = this.reprs.findIndex(repr => repr instanceof MIMERepr && repr.mimeType.startsWith("text/html"));
-        if (index > 0) return Promise.resolve(MIMERepr.unapply(this.reprs[index] as MIMERepr));
+        // TODO: for lazy data repr, inform that it can't be displayed immediately
 
-        index = this.reprs.findIndex(repr => repr instanceof MIMERepr && repr.mimeType.startsWith("text/"));
-        if (index > 0) return Promise.resolve(MIMERepr.unapply(this.reprs[index] as MIMERepr));
+        let index = -1;
 
-        index = this.reprs.findIndex(repr => repr instanceof MIMERepr);
-        if (index > 0) return Promise.resolve(MIMERepr.unapply(this.reprs[index] as MIMERepr));
-
-        index = this.reprs.findIndex(repr => repr instanceof StreamingDataRepr);
-        if (index >= 0) {
-            // surprisingly using monaco.editor.colorizeElement breaks the theme of the whole app! WAT?
-            return monaco.editor.colorize(this.typeName, "scala", {}).then(typeHTML => {
-                const streamingRepr = this.reprs[index] as StreamingDataRepr;
-                const frag = document.createDocumentFragment();
-                const resultType = span(['result-type'], []).attr("data-lang" as any, "scala");
-                resultType.innerHTML = typeHTML;
-                // Why do they put a <br> in there?
-                [...resultType.getElementsByTagName("br")].forEach(br => {if (br && br.parentNode) br.parentNode.removeChild(br)});
-                const el = div([], [
-                    h4(['result-name-and-type'], [
-                        span(['result-name'], [this.name]), ': ', resultType,
-                        iconButton(['view-data'], 'View data', '', '[View]')
-                            .click(_ => valueInspector.inspect(this, cell.path, 'View data')),
-                        iconButton(['plot-data'], 'Plot data', '', '[Plot]')
-                            .click(_ => {
-                                valueInspector.setParent(cell);
-                                valueInspector.inspect(this, cell.path, 'Plot data');
-                            })
-                    ]),
-                    displaySchema(streamingRepr.dataType)
-                ]);
-                frag.appendChild(el);
-                return ["text/html", frag];
-            })
-        }
-
+        // First, check to see if there's a special DataRepr or StreamingDataRepr
         index = this.reprs.findIndex(repr => repr instanceof DataRepr);
         if (index >= 0) {
             return monaco.editor.colorize(this.typeName, "scala", {}).then(typeHTML => {
@@ -281,8 +270,58 @@ export class ResultValue extends Result {
             })
         }
 
-        // TODO: for lazy data repr, inform that it can't be displayed immediately; maybe give a
+        index = this.reprs.findIndex(repr => repr instanceof StreamingDataRepr);
+        if (index >= 0) {
+            const repr = this.reprs[index] as StreamingDataRepr;
+            // surprisingly using monaco.editor.colorizeElement breaks the theme of the whole app! WAT?
+            return monaco.editor.colorize(this.typeName, cell.language, {}).then(typeHTML => {
+                const streamingRepr = this.reprs[index] as StreamingDataRepr;
+                const frag = document.createDocumentFragment();
+                const resultType = span(['result-type'], []).attr("data-lang" as any, "scala");
+                resultType.innerHTML = typeHTML;
+                // Why do they put a <br> in there?
+                [...resultType.getElementsByTagName("br")].forEach(br => {
+                    br?.parentNode?.removeChild(br)
+                });
 
+                const el = div([], [
+                    h4(['result-name-and-type'], [
+                        span(['result-name'], [this.name]), ': ', resultType,
+                        iconButton(['view-data'], 'View data', 'table', '[View]')
+                            .click(_ => valueInspector.inspect(this, cell.notebook, 'View data')),
+                        repr.dataType instanceof StructType
+                            ? iconButton(['plot-data'], 'Plot data', 'chart-bar', '[Plot]')
+                                .click(_ => {
+                                    valueInspector.setParent(cell);
+                                    valueInspector.inspect(this, cell.notebook, 'Plot data');
+                                })
+                            : undefined
+                    ]),
+                    repr.dataType instanceof StructType ? displaySchema(streamingRepr.dataType) : undefined
+                ]);
+                frag.appendChild(el);
+                return ["text/html", frag];
+            })
+        }
+
+        // next, if it's a MIMERepr we want to follow this order
+        const mimeOrder = [
+            "image/",
+            "application/x-latex",
+            "text/html",
+            "text/",
+        ];
+
+        for (const partialMime of mimeOrder) {
+            index = this.reprs.findIndex(repr => repr instanceof MIMERepr && repr.mimeType.startsWith(partialMime));
+            if (index >= 0) return Promise.resolve(MIMERepr.unapply(this.reprs[index] as MIMERepr));
+        }
+
+        // ok, maybe there's some other mime type we didn't expect?
+        index = this.reprs.findIndex(repr => repr instanceof MIMERepr);
+        if (index >= 0) return Promise.resolve(MIMERepr.unapply(this.reprs[index] as MIMERepr));
+
+        // just give up and show some plaintext...
         return Promise.resolve(["text/plain", this.valueText]);
     }
 }
@@ -306,7 +345,6 @@ export class ClientResult extends Result {
         throw new Error(`Class ${this.constructor.name} does not implement toOutput()`);
     }
 }
-
 
 export class ExecutionInfo extends Result {
     static codec = combined(int64, optional(int64)).to(ExecutionInfo);

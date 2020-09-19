@@ -4,18 +4,17 @@ import {DataStream, LazyDataRepr, StreamingDataRepr, UpdatingDataRepr} from "../
 import {div, iconButton, span, table, TableElement, tag, TagElement} from "../util/tags";
 import {StructType, ArrayType, StructField, DataType} from "../../data/data_type";
 import {SocketSession} from "../../comms";
+import {NotebookUI} from "./notebook";
+import {displayData} from "./display_content";
 
-function renderData(dataType: DataType, data: any): HTMLElement {
+function renderData(fieldName: string | undefined, dataType: DataType, data: any): HTMLElement {
     // TODO: nicer display
-    let value = '';
     if (dataType instanceof ArrayType || dataType instanceof StructType) {
-        value = JSON.stringify(data);
-    } else if (data !== null) {
-        value = data.toString();
-    } else {
-        value = "<null>";
+        return displayData(data, fieldName);
+    } else if (data !== null && data !== undefined) {
+        return span([], data.toString()).attr('title', data.toString())
     }
-    return span([], value).attr('title', value);
+    return span([], "<null>")
 }
 
 export class TableView {
@@ -29,13 +28,13 @@ export class TableView {
     private rows: Record<string, any>[]; // TODO: anything better than `any` here?
     private currentPos: number;
 
-    constructor(readonly repr: StreamingDataRepr, readonly path: string) {
+    constructor(readonly repr: StreamingDataRepr, readonly notebook: NotebookUI) {
         const dataType = repr.dataType;
-        this.fields = dataType.fields;
-        const fieldClasses = dataType.fields.map(field => field.name);
-        const fieldNames = dataType.fields.map(field => `${field.name}: ${field.dataType.typeName()}`);
+        this.fields = dataType.fields || [new StructField("entries", dataType)]; // if dataType is not a StructType, create a dummy entry for it.
+        const fieldClasses = this.fields.map(field => field.name);
+        const fieldNames = this.fields.map(field => `${field.name}: ${field.dataType.typeName()}`);
 
-        if (!SocketSession.get.isOpen) {
+        if (!notebook.socket.isOpen) {
             this.el = div(['table-view', 'disconnected'], [
                 "Not connected to server – must be connected in order to view data."
             ]);
@@ -49,20 +48,20 @@ export class TableView {
                 rows: []
             }),
             this.paginator = div(['paginator'], [
-                this.prevButton = iconButton([], 'Previous page', '', '<< Prev').disable().click(evt => this.pagePrev()),
-                this.nextButton = iconButton([], 'Next page', '', 'Next >>').click(evt => this.pageNext())
+                this.prevButton = iconButton([], 'Previous page', 'step-backward', '<< Prev').disable().click(evt => this.pagePrev()),
+                this.nextButton = iconButton([], 'Next page', 'step-forward', 'Next >>').click(evt => this.pageNext())
             ])
         ]);
 
         this.table.tBodies.item(0)!.appendChild(
             tag('tr', ['initial-msg'], {}, [
                 tag('td', [],  {'colSpan': this.fields.length + ''},[
-                    'Click "next page" (', span(['fas', 'icon'], ''), ') to load data.', tag('br'),
+                    'Click "next page" (', span(['fas', 'icon'], 'step-forward'), ') to load data.', tag('br'),
                     'This will force evaluation of lazy data.'
                 ])])
         );
 
-        this.stream = new DataStream(path, repr).batch(20);
+        this.stream = new DataStream(notebook.socket, repr).batch(20);
         this.rows = [];
         this.currentPos = 0;
     }
@@ -79,7 +78,7 @@ export class TableView {
         start = Math.max(start, 0);
         this.table.tBodies.item(0)!.innerHTML = '';
         for (let i = start; i < end && i < this.rows.length; i++) {
-            const row = this.fields.map(field => renderData(field.dataType, this.rows[i][field.name]));
+            const row = this.fields.map(field => renderData(field.name, field.dataType, this.rows[i].hasOwnProperty(field.name) ? this.rows[i][field.name] : this.rows[i]));
             this.table.addRow(row);
         }
         this.currentPos = start;

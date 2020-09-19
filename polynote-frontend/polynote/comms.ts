@@ -1,6 +1,9 @@
 'use strict';
 
-import { Message } from './data/messages'
+import {Message, NotebookUpdate} from './data/messages'
+import {EventTarget} from 'event-target-shim'
+import {remove} from "vega-lite/build/src/compositemark";
+import {Extractable} from "./util/match";
 
 export class PolynoteMessageEvent<T extends Message> extends CustomEvent<any> {
     constructor(readonly message: T) {
@@ -12,39 +15,77 @@ export class PolynoteMessageEvent<T extends Message> extends CustomEvent<any> {
 type ListenerCallback = (...args: any[]) => void
 export type MessageListener = [typeof Message, ListenerCallback, boolean?];
 
+const mainEl = document.getElementById('Main');
+const socketKey = mainEl?.getAttribute('data-ws-key');
+
+const openSessions: Record<string, SocketSession> = {};
+
+function wsUrl(url: URL) {
+    url = new URL(url.href);
+    if (!url.searchParams.get("key") && socketKey) {
+        url.searchParams.append("key", socketKey)
+    }
+    url.protocol = url.protocol === "https:" || url.protocol == "wss" ? 'wss:' : 'ws';
+    return url;
+}
+
+function closeAll() {
+    for (const url in Object.keys(openSessions)) {
+        const sess = openSessions[url];
+        sess.close();
+        delete openSessions[url];
+    }
+}
+
+window.addEventListener("beforeunload", closeAll);
+
 export class SocketSession extends EventTarget {
     private static inst: SocketSession;
 
-    static get get() {
+    static get global() {
         if (!SocketSession.inst) {
-            SocketSession.inst = new SocketSession()
+            SocketSession.inst = SocketSession.fromRelativeURL("ws")
         }
         return SocketSession.inst
     }
 
-    socket: WebSocket;
+    static fromRelativeURL(relativeURL: string): SocketSession {
+        const url = wsUrl(new URL(relativeURL, document.baseURI));
+        if (openSessions[url.href]) {
+            return openSessions[url.href];
+        }
+        return new SocketSession(url)
+    }
+
+    private socket?: WebSocket;
     listeners: any;
 
-    private constructor(public queue: Message[] = [], public messageListeners: MessageListener[] = []) {
+    private constructor(readonly url: URL, public queue: Message[] = [], public messageListeners: MessageListener[] = []) {
         super();
         this.mkSocket();
     }
 
     mkSocket() {
-        const schema = location.protocol === 'https:' ? 'wss://' : 'ws://';
-        this.socket = new WebSocket(schema + document.location.host + '/ws');
+        this.socket = new WebSocket(this.url.href);
         this.socket.binaryType = 'arraybuffer';
         this.listeners = {
             message: this.receive.bind(this),
             open: this.opened.bind(this),
             close: this.close.bind(this),
-            error: (event: Event) => this.dispatchEvent(new CustomEvent('error', { detail: { cause: event }}))
+            error: (event: Event) => this.onError(event)
         };
 
         this.socket.addEventListener('message', this.listeners.message);
         this.socket.addEventListener('open', this.listeners.open);
         this.socket.addEventListener('close', this.listeners.close);
         this.socket.addEventListener('error', this.listeners.error);
+    }
+
+    onError(event: Event) {
+        if (this.socket) {
+            this.close();
+            this.dispatchEvent(new CustomEvent('error', {detail: {cause: event}}));
+        }
     }
 
 
@@ -55,12 +96,12 @@ export class SocketSession extends EventTarget {
         this.dispatchEvent(new CustomEvent('open'));
     }
 
-    get isOpen() {
-        return this.socket && this.socket.readyState === WebSocket.OPEN;
+    get isOpen(): boolean {
+        return this.socket?.readyState === WebSocket.OPEN;
     }
 
     get isConnecting() {
-        return this.socket && this.socket.readyState === WebSocket.CONNECTING;
+        return this.socket?.readyState === WebSocket.CONNECTING;
     }
 
     get isClosed() {
@@ -68,7 +109,7 @@ export class SocketSession extends EventTarget {
     }
 
     send(msg: Message) {
-        if (this.isOpen) {
+        if (this.socket && this.isOpen) {
             const buf = Message.encode(msg);
             this.socket.send(buf);
         } else {
@@ -83,9 +124,13 @@ export class SocketSession extends EventTarget {
                 this.dispatchEvent(new PolynoteMessageEvent(msg)); // this is how `request` works.
 
                 for (const handler of this.messageListeners) {
-                    if (msg instanceof handler[0]) { // check not redundant even though IntelliJ complains.
-                        const result = handler[1].apply(null, handler[0].unapply(msg));
-                        if (handler[2] && result === false) {
+                    const msgType = handler[0];
+                    const listenerCB = handler[1];
+                    const removeWhenFalse = handler[2];
+
+                    if (msg instanceof msgType) { // check not redundant even though IntelliJ complains.
+                        const result = listenerCB.apply(null, msgType.unapply(msg));
+                        if (removeWhenFalse && (result === false || result === undefined)) {
                             this.removeMessageListener(handler);
                         }
                     }
@@ -96,7 +141,7 @@ export class SocketSession extends EventTarget {
         }
     }
 
-    addMessageListener(msgType: typeof Message, fn: ListenerCallback, removeWhenFalse: boolean = false) {
+    addMessageListener<M extends Message, C extends (new (...args: any[]) => M) & typeof Message>(msgType: C, fn: (...args: ConstructorParameters<typeof msgType>) => void, removeWhenFalse: boolean = false) {
         const handler: MessageListener = [msgType, fn, removeWhenFalse];
         this.messageListeners.push(handler);
         return handler;
@@ -109,7 +154,7 @@ export class SocketSession extends EventTarget {
         }
     }
 
-    listenOnceFor(msgType: typeof Message, fn: ListenerCallback) {
+    listenOnceFor<M extends Message, C extends (new (...args: any[]) => M) & typeof Message>(msgType: C, fn: (...args: ConstructorParameters<typeof msgType>) => void) {
         return this.addMessageListener(msgType, fn, true);
     }
 
@@ -129,16 +174,19 @@ export class SocketSession extends EventTarget {
     }
 
     close() {
-        if (this.socket.readyState < WebSocket.CLOSING) {
-            this.socket.close();
-        }
-        for (const l in this.listeners) {
-            if (this.listeners.hasOwnProperty(l)) {
-                this.socket.removeEventListener(l, this.listeners[l]);
+        if (this.socket) {
+            if (this.socket.readyState < WebSocket.CLOSING) {
+                this.socket.close();
             }
+            for (const l in this.listeners) {
+                if (this.listeners.hasOwnProperty(l)) {
+                    this.socket.removeEventListener(l, this.listeners[l]);
+                }
+            }
+            this.listeners = {};
+            this.socket = undefined;
+            this.dispatchEvent(new CustomEvent('close'));
         }
-        this.listeners = {};
-        this.dispatchEvent(new CustomEvent('close'));
     }
 
     reconnect(onlyIfClosed: boolean) {

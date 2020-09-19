@@ -1,7 +1,7 @@
 "use strict";
 
 import * as acorn from "acorn"
-import {Position, KernelReport, CompileErrors, Output, KernelErrorWithCause, RuntimeError} from "../data/result";
+import {Position, KernelReport, CompileErrors, Output, ServerErrorWithCause, RuntimeError} from "../data/result";
 import {DataStream, MIMERepr} from "../data/value_repr";
 import embed from "vega-embed";
 import {ClientResult} from "../data/result";
@@ -34,15 +34,6 @@ export const VegaInterpreter = {
             // some validation of the spec
             if (!spec.data)
                 throw new Error("Spec is missing data attribute");
-            if (spec.data instanceof Array) {
-                spec.data.forEach(data => {
-                    if (!data.name) {
-                        throw new Error("Spec data attribute is missing name property");
-                    }
-                });
-            } else if (!spec.data.name) {
-                throw new Error("Spec data attribute is missing name property");
-            }
 
             if (!spec["$schema"]) {
                 spec["$schema"] = 'https://vega.github.io/schema/vega-lite/v3.json';
@@ -56,6 +47,10 @@ export const VegaInterpreter = {
 
 
 };
+
+function splitOutput(outputStr) {
+    return outputStr.match(/[^\n]+\n?/g);
+}
 
 export class VegaClientResult extends ClientResult {
     constructor(spec) {
@@ -112,25 +107,16 @@ export class VegaClientResult extends ClientResult {
             img.setAttribute('src', dataURL);
             el.appendChild(img);
             const html = el.innerHTML;
-            return new Output("text/html", html);
+            return new Output("text/html", splitOutput(html));
         };
 
         return plot.view.toCanvas()
             .then(canvas => canvas.toDataURL("image/png"))
             .then(fromDataURL)
-            .catch(_ => plot.toSVG().then(svgStr => new Output("image/svg", svgStr)))
+            .catch(_ => plot.toSVG().then(svgStr => new Output("image/svg+xml", splitOutput(svgStr))))
     }
 
     toOutput() {
-        const fromDataURL = (dataURL) => {
-            const el = document.createElement('div');
-            const img = document.createElement('img');
-            img.setAttribute('src', dataURL);
-            el.appendChild(img);
-            const html = el.innerHTML;
-            return new Output("text/html", html);
-        };
-
         return this.run().then(VegaClientResult.plotToOutput);
     }
 }

@@ -55,6 +55,7 @@ export function contentTypeName(contentType: string) {
         case "text/plain": return "Text";
         case "text/html": return "HTML";
         case "image/svg": return "SVG";
+        case "image/svg+xml": return "SVG";
         default:
             if (mime.startsWith("image/")) return "Image";
             return mime;
@@ -74,7 +75,7 @@ export function parseContentType(contentType: string): [string, Record<string, s
 }
 
 export function truncate(string: any, len?: number) {
-    len = len || 32;
+    len = len ?? 32;
     if (typeof string !== "string" && !(string instanceof String)) {
         string = string.toString();
     }
@@ -134,7 +135,7 @@ export function displayData(data: any, fieldName?: string, expandObjects: boolea
             fields.appendChild(tag('li', [], {}, [displayData(val, key, expandNext)]));
         }
         return details;
-    } else if (typeof data === "object" && !(data instanceof String)) {
+    } else if (data && typeof data === "object" && !(data instanceof String)) {
         const keys = Object.keys(data);
         const summarySpan = span(['summary-content'], []);
         const summary = tag('summary', ['object-summary'], {}, [summarySpan]);
@@ -158,10 +159,16 @@ export function displayData(data: any, fieldName?: string, expandObjects: boolea
         return details;
     } else {
         let result;
-        switch (typeof data) {
-            case "number": result = span(['number'], [truncate(data.toString())]); break;
-            case "boolean": result = span(['boolean'], [data.toString()]); break;
-            default: result = span(['string'], [data.toString()]);
+        if (data !== null && data !== undefined) {
+            switch (typeof data) {
+                case "number": result = span(['number'], [truncate(data.toString())]); break;
+                case "boolean": result = span(['boolean'], [data.toString()]); break;
+                default: result = span(['string'], [data.toString()]);
+            }
+        } else if (data == null) {
+            result = span(['null'], ['null'])
+        } else {
+            result = span(['undefined'], ['undefined'])
         }
         if (fieldName) {
             return span(['object-field'], [span(['field-name'], [fieldName]), result]);

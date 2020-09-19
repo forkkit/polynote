@@ -1,6 +1,6 @@
 'use strict';
 
-type StorageListener = (oldValue: string | null, newValue: string | null) => void
+type StorageListener = (oldValue: any | null, newValue: any | null) => void
 
 export class Storage {
     constructor(readonly defaults: {[key: string]: any} = {
@@ -15,7 +15,7 @@ export class Storage {
         window.localStorage.setItem(name, newValue);
         const listeners = this.listeners[name];
         if (listeners) {
-            listeners.forEach(fn => fn(oldValue, newValue));
+            listeners.forEach(fn => fn(oldValue, value));
         }
     }
 
@@ -53,7 +53,8 @@ export class Storage {
     }
 
     addStorageListener(name: string, fn: StorageListener) {
-        this.listeners[name] = [...(this.listeners[name] || []), fn]
+        this.listeners[name] = [...(this.listeners[name] || []), fn];
+        return fn;
     }
 
     clearStorageListener(name: string, fn?: StorageListener) {
@@ -68,20 +69,16 @@ export class Storage {
 export const storage = new Storage();
 
 // Preferences are backed by Storage, but they can only store Preference values
+type PreferenceListener = (oldValue: Preference, newValue: Preference) => void
 export class Preferences {
     private readonly preferencesKey = "preferences";
     private preferences: Record<string, Preference> = {};
+    private preferenceOptions: Record<string, Record<string, any>> = {};
+    public listeners: [PreferenceListener, StorageListener][];
 
     constructor() {
-        this.preferences = {};
         const rawPrefs: Record<string, Preference> = storage.get(this.preferencesKey) || {};
-        for (const [key, json] of Object.entries(rawPrefs)) {
-            if (json && json.value !== undefined && json.description !== undefined) {
-                this.preferences[key] = new Preference(json.value, json.description);
-            } else {
-                throw new Error(`Unable to decode preference ${key} with value ${JSON.stringify(json)}`)
-            }
-        }
+        this.preferences = this.parseRaw(rawPrefs);
 
         // listen for storage clear and clear ourselves as well.
         window.addEventListener('storage', evt => {
@@ -94,12 +91,32 @@ export class Preferences {
         this.sync()
     }
 
+    parseRaw(rawPrefs: Record<string, Preference>): Record<string, Preference> {
+        const prefs: Record<string, Preference> = {};
+        for (const [key, json] of Object.entries(rawPrefs)) {
+            if (json?.value !== undefined && json?.description !== undefined) {
+                prefs[key] = new Preference(json.value, json.description);
+            } else {
+                throw new Error(`Unable to decode preference ${key} with value ${JSON.stringify(json)}`)
+            }
+        }
+        return prefs
+    }
+
     sync() {
         storage.set(this.preferencesKey, this.preferences);
     }
 
     // register a preference (only if it doesn't already exist)
-    register(name: string, initialValue: any, description?: string) {
+    register(name: string, initialValue: any, description?: string, options?: Record<string, any>) {
+        if (typeof initialValue === 'boolean' && !options) {
+            options = {"true": true, "false": false};
+        }
+
+        if (options) {
+            this.preferenceOptions[name] = options;
+        }
+
         if (!this.get(name)) {
             this.preferences[name] = new Preference(initialValue, description || "An unknown description!");
             this.sync();
@@ -107,11 +124,10 @@ export class Preferences {
         return name;
     }
 
-    set(name: string, newValue: any, description?: string) {
+    set(name: string, newValue: any) {
         const pref = this.get(name);
         if (pref) {
             pref.value = newValue;
-            if (description) pref.description = description;
             this.preferences[name] = pref;
             this.sync();
         } else {
@@ -119,8 +135,12 @@ export class Preferences {
         }
     }
 
-    get(name: string) {
+    get(name: string): Preference {
         return this.preferences[name];
+    }
+
+    getOptions(name: string): Record<string, any> | undefined {
+        return this.preferenceOptions[name];
     }
 
     clear() {
@@ -136,11 +156,25 @@ export class Preferences {
         return this.preferences;
     }
 
+    addPreferenceListener(name: string, fn: PreferenceListener) {
+        storage.addStorageListener(this.preferencesKey, (oldValue, newValue) => {
+            if (oldValue && newValue) {
+                fn(this.parseRaw(oldValue)[name], this.parseRaw(newValue)[name]);
+            }
+        })
+    }
+
+    clearPreferenceListener(name: string, fn: PreferenceListener) {
+        const listener = this.listeners.find(tup => tup[0] === fn);
+        if (listener) {
+            storage.clearStorageListener(name, fn && listener[1])
+        }
+    }
 }
 
 // Preferences are just values with a description which is used for display purposes
 export class Preference {
-    constructor(public value: any, public description: string) {}
+    constructor(public value: any, readonly description: string) {}
 }
 
 export const preferences = new Preferences();

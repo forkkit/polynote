@@ -1,16 +1,16 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <title>Polynote</title>
     <meta charset="utf-8" />
-    <base href="/" />
-    <link rel="stylesheet" type="text/css" href="/style/styles.css" />
-    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.3.1/css/all.css" integrity="sha384-mzrmE5qonljUremFsqc01SB46JvROS7bZs3IO2EmfFsd15uHvIt+Y8vEf7N7fWAU" crossorigin="anonymous">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.10.1/dist/katex.css" integrity="sha384-b/NoaeRXkMxyKcrDw2KtVtYKkVg3dA0rTRgLoV7W2df3MzeR1eHLTi+l4//4fMwk" crossorigin="anonymous">
-    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.10.1/dist/katex.js" integrity="sha384-ern5NCRqs6nJ/a4Ik0nB9hnKVH5HwV2XRUYdQl09OB/vvd1Lmmqbg1Mh+mYUclXx" crossorigin="anonymous"></script>
+    <base href="$BASE_URI" />
+    <link rel="stylesheet" type="text/css" href="static/style/styles.css" />
+    <link rel="stylesheet" type="text/css" href="static/style/colors-light.css" id="polynote-color-theme" />
+    <link rel="stylesheet" href="static/vendor/katex/katex.min.css">
+    <script defer src="static/vendor/katex/katex.min.js"></script>
     <meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
   </head>
   <body>
-    <div id="Main"/>
+    <div id="Main" data-ws-key="$WS_KEY" />
   </body>
 </html>

@@ -2,11 +2,13 @@ package polynote.testing.kernel.remote
 
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 import polynote.kernel.{BaseEnv, GlobalEnv, Kernel}
 import polynote.kernel.environment.CurrentNotebook
+import polynote.kernel.logging.Logging
 import polynote.kernel.remote.{RemoteKernelClient, SocketTransport}
-import zio.{Fiber, Ref, RIO, ZIO}
+import zio.{Fiber, RIO, Ref, ZIO}
 import zio.duration.Duration
 
 class InProcessDeploy(kernelFactory: Kernel.Factory.LocalService, clientRef: Ref[RemoteKernelClient]) extends SocketTransport.Deploy {
@@ -16,9 +18,9 @@ class InProcessDeploy(kernelFactory: Kernel.Factory.LocalService, clientRef: Ref
         Some(serverAddress.getHostString),
         Some(serverAddress.getPort),
         Some(kernelFactory)),
-      Some(clientRef)).interruptChildren
+      Some(clientRef))
 
-    connectClient.fork.map(new InProcessDeploy.Process(_))
+    connectClient.forkDaemon.map(new InProcessDeploy.Process(_))
   }
 
 }
@@ -30,8 +32,9 @@ object InProcessDeploy {
       case None => ZIO.succeed(None)
     }
 
-    def awaitExit(timeout: Long, timeUnit: TimeUnit): RIO[BaseEnv, Option[Int]] =
-      fiber.join.timeout(Duration(timeout, timeUnit))
+    def awaitExit(timeout: Long, timeUnit: TimeUnit): RIO[BaseEnv, Option[Int]] = {
+      fiber.join.disconnect.timeout(Duration(timeout, timeUnit))
+    }
 
     def kill(): RIO[BaseEnv, Unit] = fiber.interrupt.unit
   }

@@ -1,24 +1,45 @@
 "use strict";
 
-import {blockquote, button, div, DropdownElement, iconButton, span, tag, TagElement} from "../util/tags";
+import {
+    blockquote,
+    button,
+    details,
+    div,
+    dropdown,
+    DropdownElement,
+    iconButton,
+    span,
+    tag,
+    TagElement
+} from "../util/tags";
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
+import {
+    editor,
+    IDisposable,
+    IKeyboardEvent,
+    IPosition,
+    KeyCode,
+    languages,
+    SelectionDirection
+} from 'monaco-editor/esm/vs/editor/editor.api';
 // @ts-ignore (ignore use of non-public monaco api)
 import {StandardKeyboardEvent} from 'monaco-editor/esm/vs/base/browser/keyboardEvent'
 import {
     ClearResults,
+    ClientResult,
     CompileErrors,
-    KernelErrorWithCause,
+    ExecutionInfo,
+    ServerErrorWithCause,
     KernelReport,
     Output,
     PosRange,
     Result,
-    ResultValue, RuntimeError
+    ResultValue,
+    RuntimeError
 } from "../../data/result"
 import {RichTextEditor} from "./text_editor";
-import {SelectCell, UIMessageTarget} from "../util/ui_event"
+import {CellSelected, CurrentIdentity, UIMessageRequest, UIMessageTarget} from "../util/ui_event"
 import {Diff} from '../../util/diff'
-import {details, dropdown} from "../util/tags";
-import {ClientResult, ExecutionInfo} from "../../data/result";
 import {preferences} from "../util/storage";
 import {createVim} from "../util/vim";
 import {KeyAction} from "../util/hotkeys";
@@ -26,17 +47,20 @@ import {clientInterpreters} from "../../interpreter/client_interpreter";
 import {ValueInspector} from "./value_inspector";
 import {Interpreters} from "./ui";
 import {displayContent, parseContentType, prettyDuration} from "./display_content";
-import {CellMetadata} from "../../data/data";
+import {CellComment, CellMetadata} from "../../data/data";
 import {ContentEdit, Delete, Insert} from "../../data/content_edit";
-import { editor, IDisposable, IKeyboardEvent, IPosition, KeyCode, languages } from "monaco-editor/esm/vs/editor/editor.api";
+import {FoldingController, SuggestController} from "../monaco/extensions";
+import {CurrentNotebook} from "./current_notebook";
+import {NotebookUI} from "./notebook";
 import CompletionList = languages.CompletionList;
 import SignatureHelp = languages.SignatureHelp;
 import IStandaloneCodeEditor = editor.IStandaloneCodeEditor;
-import {FoldingController, SuggestController} from "../monaco/extensions";
 import IModelContentChangedEvent = editor.IModelContentChangedEvent;
 import IIdentifiedSingleEditOperation = editor.IIdentifiedSingleEditOperation;
-import {CurrentNotebook} from "./current_notebook";
 import SignatureHelpResult = languages.SignatureHelpResult;
+import TrackedRangeStickiness = editor.TrackedRangeStickiness;
+import {CommentID, CommentHandler} from "./comment";
+import EditorOption = editor.EditorOption;
 
 export type CellContainer = TagElement<"div"> & {
     cell: Cell
@@ -59,14 +83,16 @@ export abstract class Cell extends UIMessageTarget {
     readonly resultTabs: TagElement<"div">;
     protected keyMap: Map<KeyCode, KeyAction>;
 
-    constructor(readonly id: number, public language: string, readonly path: string, public metadata?: CellMetadata) {
+    get path(): string { return this.notebook.path }
+
+    constructor(readonly id: number, public language: string, readonly notebook: NotebookUI, public metadata?: CellMetadata) {
         super();
         if (!language) throw {message: `Attempted to create cell ${id} with empty language!`};
 
         const containerEl = div(['cell-container', language], [
             this.cellInput = div(['cell-input'], [
                 this.cellInputTools = div(['cell-input-tools'], [
-                    iconButton(['run-cell'], 'Run this cell (only)', '', 'Run').click((evt) => {
+                    iconButton(['run-cell'], 'Run this cell (only)', 'play', 'Run').click((evt) => {
                         CurrentNotebook.get.runCells(this.id);
                     }),
                     //iconButton(['run-cell', 'refresh'], 'Run this cell and all dependent cells', '', 'Run and refresh')
@@ -120,7 +146,7 @@ export abstract class Cell extends UIMessageTarget {
                 this.setUrl();
             }
 
-            this.publish(new SelectCell(this));
+            this.publish(new CellSelected(this));
         }
     }
 
@@ -190,7 +216,7 @@ export abstract class Cell extends UIMessageTarget {
 
             if (this instanceof CodeCell && action.ignoreWhenSuggesting) {
                 // this is really ugly, is there a better way to tell whether the widget is visible??
-                const suggestionsVisible = (this.editor.getContribution('editor.contrib.suggestController') as SuggestController)._widget._value.suggestWidgetVisible.get();
+                const suggestionsVisible = (this.editor.getContribution('editor.contrib.suggestController') as SuggestController).widget._value.suggestWidgetVisible.get();
                 if (!suggestionsVisible) { // don't do stuff when suggestions are visible
                     runAction()
                 }
@@ -254,19 +280,17 @@ export abstract class Cell extends UIMessageTarget {
             new KeyAction((pos, range, selection, cell) => CurrentNotebook.get.deleteCell(cell.id))
                 .withDesc("Delete this cell.")],
     ]);
-
-
 }
 
 // TODO: it's a bit hacky to export this, should probably put this in some utils module
-export function errorDisplay(error: KernelErrorWithCause, currentFile: string, maxDepth: number = 0, nested: boolean = false): {el: TagElement<"details"> | TagElement<"div">, messageStr: string, cellLine: number | null} {
+export function errorDisplay(error: ServerErrorWithCause, currentFile: string, maxDepth: number = 0, nested: boolean = false): {el: TagElement<"details"> | TagElement<"div">, messageStr: string, cellLine: number | null} {
     let cellLine: number | null = null;
     const traceItems: TagElement<"li">[] = [];
     const messageStr = `${error.message} (${error.className})`;
 
     let reachedIrrelevant = false;
 
-    if (error.stackTrace && error.stackTrace.length) {
+    if (error.stackTrace?.length) {
         error.stackTrace.forEach((traceEl, i) => {
             if (traceEl.file === currentFile && traceEl.line >= 0) {
                 if (cellLine === null)
@@ -315,14 +339,24 @@ export class CodeCell extends Cell {
     private highlightDecorations: string[];
     private execDurationUpdater: number;
     public vim: any | null;
+    private presenceMarkers: Record<number, string[]> = {};
+    readonly commentHandler: CommentHandler;
 
     static keyMapOverrides = new Map([
         [monaco.KeyCode.DownArrow, new KeyAction((pos, range, selection, cell: CodeCell) => {
-            if (cell.vim && !cell.vim.state.vim.insertMode) { // in normal/visual mode, the last column is never selected
+            if (!cell.vim?.state.vim.insertMode) { // in normal/visual mode, the last column is never selected
                 (range as any) // force mutability on endColumn (hacky)
                     .endColumn -= 1
             }
         })],
+        // run all cells
+        [monaco.KeyMod.Shift | monaco.KeyCode.F10,
+            new KeyAction((pos, range, selection, cell) => CurrentNotebook.get.runAllCells())
+                .withDesc("Run all cells.")],
+        // run to cursor
+        [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.F9,
+            new KeyAction((pos, range, selection, cell) => CurrentNotebook.get.runToCursor())
+                .withDesc("Run to cursor.")],
         // run cell on enter
         [monaco.KeyMod.Shift | monaco.KeyCode.Enter,
             new KeyAction((pos, range, selection, cell) => CurrentNotebook.get.runCells(cell.id))
@@ -334,8 +368,8 @@ export class CodeCell extends Cell {
                 .withDesc("Run this cell and insert a new cell below it.")]
     ]);
 
-    constructor(id: number, initContent: string, language: string, path: string, metadata?: CellMetadata) {
-        super(id, language, path, metadata);
+    constructor(id: number, initContent: string, language: string, notebook: NotebookUI, metadata?: CellMetadata) {
+        super(id, language, notebook, metadata);
         this.container.classList.add('code-cell');
 
         this.cellInputTools.appendChild(div(['cell-label'], [id + ""]));
@@ -359,7 +393,7 @@ export class CodeCell extends Cell {
         this.cellInputTools.appendChild(
             div(['options'], [
                 button(['toggle-code'], {title: 'Show/Hide Code'}, ['{}']).click(evt => this.toggleCode()),
-                iconButton(['toggle-output'], 'Show/Hide Output', '', 'Show/Hide Output').click(evt => this.toggleOutput())
+                iconButton(['toggle-output'], 'Show/Hide Output', 'align-justify', 'Show/Hide Output').click(evt => this.toggleOutput())
             ])
         );
 
@@ -373,7 +407,7 @@ export class CodeCell extends Cell {
             }
         }
 
-        const highlightLanguage = (clientInterpreters[language] && clientInterpreters[language].highlightLanguage) || language;
+        const highlightLanguage = clientInterpreters[language]?.highlightLanguage ?? language;
         this.highlightLanguage = highlightLanguage;
 
 
@@ -386,7 +420,6 @@ export class CodeCell extends Cell {
             minimap: { enabled: false },
             parameterHints: {enabled: true},
             scrollBeyondLastLine: false,
-            theme: 'polynote',
             fontFamily: 'Hasklig, Fira Code, Menlo, Monaco, fixed',
             fontSize: 15,
             fontLigatures: true,
@@ -395,7 +428,10 @@ export class CodeCell extends Cell {
             lineNumbers: 'on',
             lineNumbersMinChars: 1,
             lineDecorationsWidth: 0,
-            renderLineHighlight: "none"
+            renderLineHighlight: "none",
+            scrollbar: {
+                alwaysConsumeMouseWheel: false
+            }
         });
 
         this.editorEl.style.height = (this.editor.getScrollHeight()) + "px";
@@ -414,11 +450,13 @@ export class CodeCell extends Cell {
         });
 
         this.editor.onDidChangeCursorSelection(evt => {
-            // we only care if the user has selected more than a single character
+            // deep link - we only care if the user has selected more than a single character
             if ([0, 3].includes(evt.reason)) { // 0 -> NotSet, 3 -> Explicit
                 this.setUrl(evt.selection);
             }
 
+            // presence
+            this.notifySelection();
         });
 
         (this.editor.getContribution('editor.contrib.folding') as FoldingController).getFoldingModel()!.then(
@@ -426,7 +464,7 @@ export class CodeCell extends Cell {
         );
 
         this.lastLineTop = this.editor.getTopForLineNumber(this.editor.getModel()!.getLineCount());
-        this.lineHeight = this.editor.getConfiguration().lineHeight;
+        this.lineHeight = this.editor.getOption(EditorOption.lineHeight);
 
         this.editListener = this.editor.onDidChangeModelContent(event => this.onChangeModelContent(event));
 
@@ -440,19 +478,39 @@ export class CodeCell extends Cell {
         this.onWindowResize = (evt) => this.editor.layout();
         window.addEventListener('resize', this.onWindowResize);
 
-        if (this.metadata && this.metadata.executionInfo) {
+        if (this.metadata?.executionInfo) {
             this.setExecutionInfo(this.metadata.executionInfo);
+        }
+
+        this.commentHandler = new CommentHandler(this.id, this.editor).setParent(this)
+    }
+
+    notifySelection() {
+        const selection = this.editor.getSelection();
+        if (selection) {
+            const model = this.editor.getModel();
+            if (model) {
+                const range = new PosRange(model.getOffsetAt(selection.getStartPosition()), model.getOffsetAt(selection.getEndPosition()));
+                if (selection.getDirection() === SelectionDirection.RTL) {
+                    this.notebook.setCurrentSelection(this.id, range.reversed);
+                } else {
+                    this.notebook.setCurrentSelection(this.id, range);
+                }
+
+                // notify the comment handler
+                this.commentHandler.handleSelection(selection);
+            }
         }
     }
 
     setDisabled(disabled: boolean) {
-        const isDisabled = this.editor.getConfiguration().readOnly;
+        const isDisabled = this.editor.getOption(EditorOption.readOnly);
         if (disabled && !isDisabled) {
             this.editor.updateOptions({readOnly: true});
             [...this.cellInputTools.querySelectorAll('.run-cell')].forEach((button: HTMLButtonElement) => button.disabled = true);
         } else if (!disabled && isDisabled) {
             this.editor.updateOptions({readOnly: false});
-            if (this.metadata && !this.metadata.disableRun) {
+            if (!this.metadata?.disableRun) {
                 [...this.cellInputTools.querySelectorAll('.run-cell')].forEach((button: HTMLButtonElement) => button.disabled = false);
             }
         }
@@ -463,7 +521,7 @@ export class CodeCell extends Cell {
         super.setMetadata(metadata);
         if (metadata.hideSource) {
             this.container.classList.add('hide-code');
-        } else if (prevMetadata && prevMetadata.hideSource) {
+        } else if (prevMetadata?.hideSource) {
             this.container.classList.remove('hide-code');
             this.updateEditorHeight();
             this.editor.layout();
@@ -477,14 +535,14 @@ export class CodeCell extends Cell {
     }
 
     toggleCode() {
-        const prevMetadata = this.metadata || new CellMetadata();
+        const prevMetadata = this.metadata ?? new CellMetadata();
         this.setMetadata(prevMetadata.copy({hideSource: !prevMetadata.hideSource}));
         CurrentNotebook.get.handleContentChange(this.id, [], this.metadata);
     }
 
     toggleOutput() {
         this.container.classList.toggle('hide-output');
-        const prevMetadata = this.metadata || new CellMetadata();
+        const prevMetadata = this.metadata ?? new CellMetadata();
         this.setMetadata(prevMetadata.copy({hideOutput: !prevMetadata.hideOutput}));
         CurrentNotebook.get.handleContentChange(this.id, [], this.metadata);
     }
@@ -574,7 +632,7 @@ export class CodeCell extends Cell {
         }
     }
 
-    setRuntimeError(error: KernelErrorWithCause) {
+    setRuntimeError(error: ServerErrorWithCause) {
         const {el, messageStr, cellLine} = errorDisplay(error, this.container.id, 3);
 
         this.cellOutputDisplay.classList.add('errors');
@@ -586,20 +644,24 @@ export class CodeCell extends Cell {
 
         this.container.classList.add('error');
 
-        if (cellLine !== null && cellLine >= 0) {
-            const model = this.editor.getModel()!;
-            monaco.editor.setModelMarkers(
-                model,
-                this.id.toString(),
-                [{
-                    message: messageStr,
-                    startLineNumber: cellLine,
-                    endLineNumber: cellLine,
-                    startColumn: model.getLineMinColumn(cellLine),
-                    endColumn: model.getLineMaxColumn(cellLine),
-                    severity: 8
-                }]
-            );
+        try {
+            if (cellLine !== null && cellLine >= 0) {
+                const model = this.editor.getModel()!;
+                monaco.editor.setModelMarkers(
+                    model,
+                    this.id.toString(),
+                    [{
+                        message: messageStr,
+                        startLineNumber: cellLine,
+                        endLineNumber: cellLine,
+                        startColumn: model.getLineMinColumn(cellLine),
+                        endColumn: model.getLineMaxColumn(cellLine),
+                        severity: 8
+                    }]
+                );
+            }
+        } catch(err) {
+            // location of error is missing.
         }
     }
 
@@ -634,7 +696,7 @@ export class CodeCell extends Cell {
             const lines = content.split(/\n/g);
 
 
-            if (!this.stdOutEl || !this.stdOutEl.parentNode) {
+            if (! this.stdOutEl?.parentNode) {
                 this.stdOutEl = this.mimeEl(mimeType, args, "");
                 this.stdOutLines = lines.length;
                 this.cellOutputDisplay.appendChild(this.stdOutEl);
@@ -662,7 +724,7 @@ export class CodeCell extends Cell {
 
                 // fold all but the first 5 and last 5 lines into an expandable thingy
                 const numHiddenLines = this.stdOutLines - 11;
-                if (!this.stdOutDetails || !this.stdOutDetails.parentNode) {
+                if (! this.stdOutDetails?.parentNode) {
                     this.stdOutDetails = tag('details', [], {}, [
                         tag('summary', [], {}, [span([], '')])
                     ]);
@@ -737,7 +799,7 @@ export class CodeCell extends Cell {
             console.log(result.error);
             this.setRuntimeError(result.error);
         } else if (result instanceof Output) {
-            this.addOutput(result.contentType, result.content);
+            this.addOutput(result.contentType, result.content.join(''));
         } else if (result instanceof ClearResults) {
             this.clearResult();
         } else if (result instanceof ExecutionInfo) {
@@ -761,10 +823,9 @@ export class CodeCell extends Cell {
                 let inspectIcon: TagElement<"button">[] = [];
                 if (result.reprs.length > 1) {
                     inspectIcon = [
-                        iconButton(['inspect'], 'Inspect', '', 'Inspect').click(
+                        iconButton(['inspect'], 'Inspect', 'search', 'Inspect').click(
                             evt => {
-                                ValueInspector.get().setParent(this);
-                                ValueInspector.get().inspect(result, this.path)
+                                ValueInspector.get().setParent(this).inspect(result, this.notebook)
                             }
                         )
                     ]
@@ -774,7 +835,7 @@ export class CodeCell extends Cell {
                 this.cellResultMargin.innerHTML = '';
                 this.cellResultMargin.appendChild(outLabel);
 
-                result.displayRepr(this, ValueInspector.get()).then(display => {
+                result.displayRepr(this, ValueInspector.get().setParent(this)).then(display => {
                     const [mime, content] = display;
                     const [mimeType, args] = parseContentType(mime);
                     this.buildOutput(mime, args, content).then((el: MIMEElement) => {
@@ -795,7 +856,7 @@ export class CodeCell extends Cell {
             className = "currently-executing"
         }
         if (pos) {
-            const oldExecutionPos = this.highlightDecorations || [];
+            const oldExecutionPos = this.highlightDecorations ?? [];
             const model = this.editor.getModel()!;
             const startPos = pos instanceof PosRange ? model.getPositionAt(pos.start) : pos.startPos;
             const endPos = pos instanceof PosRange ? model.getPositionAt(pos.end) : pos.endPos;
@@ -813,7 +874,7 @@ export class CodeCell extends Cell {
 
     setExecutionInfo(result: ExecutionInfo) {
         const start = new Date(Number(result.startTs));
-        const endTs = result.endTs || Date.now();
+        const endTs = result.endTs ?? Date.now();
         const duration = Number(endTs) - Number(result.startTs);
         // clear display
         this.execInfoEl.innerHTML = '';
@@ -838,7 +899,7 @@ export class CodeCell extends Cell {
     setStatus(status: "running" | "queued" | "error" | "complete") {
         switch(status) {
             case "complete":
-                this.container.classList.remove('running', 'queued', 'error');
+                this.container.classList.remove('running', 'queued');
                 break;
             case "error":
                 this.container.classList.remove('queued', 'running');
@@ -849,7 +910,7 @@ export class CodeCell extends Cell {
                 this.container.classList.add('queued');
                 break;
             case "running":
-                this.container.classList.remove('queued', 'error');
+                this.container.classList.remove('queued');
                 this.container.classList.add('running');
                 break;
         }
@@ -857,6 +918,10 @@ export class CodeCell extends Cell {
 
     isRunning() {
         return this.execInfoEl.classList.contains("running")
+    }
+
+    isError() {
+        return this.container.classList.contains("error")
     }
 
     static colorize(content: string, lang: string) {
@@ -879,6 +944,43 @@ export class CodeCell extends Cell {
                 const node = div(['result'], []);
                 node.innerHTML = content;
                 return Promise.resolve(node);
+        }
+    }
+
+    setPresence(id: number, name: string, color: string, range: PosRange) {
+        const model = this.editor.getModel();
+        if (model) {
+            const old = this.presenceMarkers[id] ?? [];
+            const startPos = model.getPositionAt(range.start);
+            const endPos = model.getPositionAt(range.end);
+            const newDecorations = [
+                {
+                    range: monaco.Range.fromPositions(endPos, endPos),
+                    options: {
+                        className: `ppc ${color}`,
+                        stickiness: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+                        hoverMessage: { value: name }
+                    }
+                }
+            ];
+            if (range.start != range.end) {
+                newDecorations.unshift({
+                    range: monaco.Range.fromPositions(startPos, endPos),
+                    options: {
+                        className: `${color}`,
+                        stickiness: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+                        hoverMessage: { value: name }
+                    }
+                });
+            }
+            this.presenceMarkers[id] = this.editor.deltaDecorations(old, newDecorations);
+        }
+    }
+
+    removePresence(id: number) {
+        if (this.presenceMarkers[id]) {
+            this.editor.deltaDecorations(this.presenceMarkers[id], []);
+            delete this.presenceMarkers[id];
         }
     }
 
@@ -915,6 +1017,9 @@ export class CodeCell extends Cell {
     makeActive() {
         super.makeActive();
         this.activateVim();
+
+        // presence
+        this.notifySelection();
     }
 
     focus() {
@@ -1050,8 +1155,8 @@ export class TextCell extends Cell {
     readonly editor: RichTextEditor;
     private lastContent: string;
 
-    constructor(id: number, content: string, path: string, metadata?: CellMetadata) {
-        super(id, 'text', path, metadata);
+    constructor(id: number, content: string, notebook: NotebookUI, metadata?: CellMetadata) {
+        super(id, 'text', notebook, metadata);
         this.container.classList.add('text-cell');
         this.editorEl.classList.add('markdown-body');
         this.container.cell = this;
@@ -1167,7 +1272,7 @@ export class TextCell extends Cell {
     getRange() {
         const contentLines = this.getContentNodes();
 
-        const lastLine = (contentLines[contentLines.length - 1] && contentLines[contentLines.length - 1].textContent) || "";
+        const lastLine = contentLines[contentLines.length - 1]?.textContent || "";
 
         return {
             startLineNumber: 1, // start at 1 like Monaco

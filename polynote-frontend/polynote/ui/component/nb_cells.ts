@@ -1,12 +1,13 @@
 import {UIMessageTarget} from "../util/ui_event";
 import {NotebookConfigUI} from "./nb_config";
-import {div, span, TagElement} from "../util/tags";
-import {Cell, CellContainer, CodeCell, isCellContainer, TextCell} from "./cell";
+import {blockquote, div, icon, span, TagElement} from "../util/tags";
+import {Cell, CellContainer, CodeCell, errorDisplay, isCellContainer, TextCell} from "./cell";
 import {TaskInfo, TaskStatus} from "../../data/messages";
+import * as messages from "../../data/messages";
 import {storage} from "../util/storage";
 import {clientInterpreters} from "../../interpreter/client_interpreter";
 import * as monaco from "monaco-editor";
-import {PosRange} from "../../data/result";
+import {PosRange, ServerErrorWithCause} from "../../data/result";
 import {NotebookUI} from "./notebook";
 import {CurrentNotebook} from "./current_notebook";
 import {NotebookConfig} from "../../data/data";
@@ -18,12 +19,10 @@ export class NotebookCellsUI extends UIMessageTarget {
     readonly configUI: NotebookConfigUI;
     readonly el: NotebookCellsEl;
     resizeTimeout: number;
-    readonly notebookUI: NotebookUI;
     private configEl: TagElement<"div">;
 
-    constructor(parent: NotebookUI, readonly path: string) {
-        super(parent);
-        this.notebookUI = parent; // TODO: get rid of this
+    constructor(readonly notebook: NotebookUI, readonly path: string) {
+        super(notebook);
         this.disabled = false;
         this.configUI = new NotebookConfigUI((conf: NotebookConfig) => CurrentNotebook.get.updateConfig(conf)).setParent(this);
         this.el = Object.assign(
@@ -54,6 +53,11 @@ export class NotebookCellsUI extends UIMessageTarget {
         this.forEachCell(cell => cell.setDisabled(disabled));
     }
 
+    setLoadingFailure(error: ServerErrorWithCause) {
+        this.el.innerHTML = "";
+        this.el.appendChild(blockquote(['error-report'], [errorDisplay(error, "").el]));
+    }
+
     setStatus(id: number, status: TaskInfo) {
         const cell = this.getCell(id);
         if (cell instanceof CodeCell) {
@@ -77,7 +81,7 @@ export class NotebookCellsUI extends UIMessageTarget {
         }
     }
 
-    setExecutionHighlight(id: number, pos: PosRange | null) {
+    setExecutionHighlight(id: number, pos?: PosRange) {
         const cell = this.getCell(id);
         if (cell instanceof CodeCell) {
             cell.setHighlight(pos, "currently-executing");
@@ -191,14 +195,14 @@ export class NotebookCellsUI extends UIMessageTarget {
         const newCellId = this.getMaxCellId() + 1;
         const mkCell = (oldCell?: Cell) => {
             if (oldCell instanceof CodeCell) {
-                return new CodeCell(newCellId, '', oldCell.language, this.path)
+                return new CodeCell(newCellId, '', oldCell.language, this.notebook)
             } else {
-                return new CodeCell(newCellId, '', 'scala', this.path) // default new cells are scala cells
+                return new CodeCell(newCellId, '', 'scala', this.notebook) // default new cells are scala cells
             }
         };
 
         const prev = el && this.getCellBeforeEl(el);
-        const newCell = (cell && cell(newCellId)) || mkCell(prev);
+        const newCell = cell?.(newCellId) ?? mkCell(prev);
 
         // it'd be nice if we could use some simpler logic here :\
         // most of this logic is to ensure that there's always a new cell divider in between each cell, above the first cell, and below the last cell.
@@ -237,7 +241,7 @@ export class NotebookCellsUI extends UIMessageTarget {
             const nextCell = this.getCellAfter(cellToDelete);
 
             const undoEl = div(['undo-delete'], [
-                span(['close-button', 'fa'], ['']).click(evt => {
+                icon(['close-button'], 'times', 'close icon').click(evt => {
                     undoEl.parentNode!.removeChild(undoEl);
 
                     // don't actually get rid of the cell from the UI while we still might undo it.
@@ -249,8 +253,8 @@ export class NotebookCellsUI extends UIMessageTarget {
                     span(['undo-link'], ['Undo']).click(evt => {
                         const mkCell = (nextCellId: number) => {
                             return cellToDelete.language !== "text"
-                                ? new CodeCell(nextCellId, cellToDelete.content, cellToDelete.language, this.path)
-                                : new TextCell(nextCellId, cellToDelete.content, this.path);
+                                ? new CodeCell(nextCellId, cellToDelete.content, cellToDelete.language, this.notebook)
+                                : new TextCell(nextCellId, cellToDelete.content, this.notebook);
                         };
 
                         const prevCell = this.getCellBeforeEl(undoEl);
@@ -324,7 +328,7 @@ export class NotebookCellsUI extends UIMessageTarget {
         if (currentCell instanceof TextCell && language !== 'text') {
             // replace text cell with a code cell
             const textContent = currentCell.container.innerText.trim(); // innerText has just the plain text without any HTML formatting
-            const newCell = new CodeCell(currentCell.id, currentCell.content, language, this.path, currentCell.metadata);
+            const newCell = new CodeCell(currentCell.id, currentCell.content, language, this.notebook, currentCell.metadata);
             this.el.replaceChild(newCell.container, currentCell.container);
             currentCell.dispose();
             this.setupCell(newCell);
@@ -337,14 +341,14 @@ export class NotebookCellsUI extends UIMessageTarget {
             newCell.focus();
         } else if (currentCell instanceof CodeCell && language === 'text') {
             // replace code cell with a text cell
-            const newCell = new TextCell(currentCell.id, currentCell.content, this.path, currentCell.metadata);
+            const newCell = new TextCell(currentCell.id, currentCell.content, this.notebook, currentCell.metadata);
             this.el.replaceChild(newCell.container, currentCell.container);
             currentCell.dispose();
             this.setupCell(newCell);
             newCell.focus();
         } else {
             // already a code cell, change the language
-            const highlightLanguage = (clientInterpreters[language] && clientInterpreters[language].highlightLanguage) || language;
+            const highlightLanguage = clientInterpreters[language]?.highlightLanguage ?? language;
             monaco.editor.setModelLanguage((currentCell as CodeCell).editor.getModel()!, highlightLanguage);
             currentCell.setLanguage(language);
             currentCell.focus();

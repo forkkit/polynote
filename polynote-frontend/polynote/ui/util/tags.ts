@@ -1,9 +1,17 @@
 'use strict';
 
-type ContentElement = (Node | string | undefined)
-export type Content = ContentElement | ContentElement[]
+import {loadIcon} from "./icons";
 
-function appendContent(el: Node, content: Content) {
+type ContentElement = (Node | string | undefined)
+export type Content = ContentElement | ContentElement[];
+export type AsyncContent = Content | Promise<ContentElement>
+
+function appendContent(el: Node, content: AsyncContent) {
+    if (content instanceof Promise) {
+        content.then(c => appendContent(el, c));
+        return;
+    }
+
     if (!(content instanceof Array)) {
         content = [content];
     }
@@ -17,7 +25,7 @@ function appendContent(el: Node, content: Content) {
     }
 }
 
-type AllowedElAttrs<T extends HTMLElement> = Partial<Record<keyof T, string | boolean>>
+export type AllowedElAttrs<T extends HTMLElement> = Partial<Record<keyof T, string | boolean>>
 
 export type TagElement<K extends keyof HTMLElementTagNameMap, T extends HTMLElementTagNameMap[K] = HTMLElementTagNameMap[K]> = HTMLElementTagNameMap[K] & {
     attr(a: keyof T, b: string | boolean): TagElement<K, T>
@@ -35,7 +43,7 @@ export function tag<T extends keyof HTMLElementTagNameMap>(
     name: T,
     classes: string[] = [],
     attributes?: AllowedElAttrs<HTMLElementTagNameMap[T]>,
-    content: Content = []): TagElement<T> {
+    content: AsyncContent = []): TagElement<T> {
 
     const el: TagElement<T> = Object.assign(document.createElement(name), {
         attr(a: keyof HTMLElementTagNameMap[T], v: string | boolean) {
@@ -95,9 +103,48 @@ export function para(classes: string[], content: Content) {
     return tag('p', classes, undefined, content);
 }
 
-export function span(classes: string[], content: Content) {
+export function span(classes: string[], content: AsyncContent) {
     return tag('span', classes, undefined, content);
 }
+
+export function img(classes: string[], src: string, alt: string) {
+    return tag('img', classes, {src, alt}, []);
+}
+
+export function icon(classes: string[], iconName: string, alt?: string) {
+    const icon = loadIcon(iconName).then(svgEl => {
+        const el = svgEl.cloneNode(true) as SVGElement;
+        el.setAttribute('class', 'icon');
+        if (alt) {
+            el.setAttribute('alt', alt);
+        }
+        return el;
+    });
+    return span(classes, icon);
+}
+
+export function a(classes: string[], href: string, contentOrPreventNavigate: Content | boolean, contentWhenPreventNavigate?: Content) {
+    const preventNavigate = typeof(contentOrPreventNavigate) === "boolean" ? contentOrPreventNavigate : false;
+    const content = typeof(contentOrPreventNavigate) === "boolean" ? contentWhenPreventNavigate : contentOrPreventNavigate;
+    const a = tag("a", classes, {href: href, toString: href}, content);
+    if (preventNavigate) {
+        a.addEventListener("click", (evt: MouseEvent) => {
+            evt.preventDefault();
+            return false;
+        });
+    }
+    return a;
+}
+
+// This is supposed to create an inline SVG so we can style it with CSS. I'm not sure why it doesn't work though...
+// export function icon(classes: string[], iconName: string, alt: string) {
+//     const use = document.createElement("use");
+//     const svgLoc = `/style/icons/fa/${iconName}.svg`;
+//     use.setAttribute('href', svgLoc);
+//     const svg = document.createElement("svg");
+//     svg.appendChild(use);
+//     return span(classes, svg);
+// }
 
 export function div(classes: string[], content: Content) {
     return tag('div', classes, undefined, content);
@@ -110,12 +157,9 @@ export function button(classes: string[], attributes: Record<string, string>, co
     return tag('button', classes, attributes, content);
 }
 
-export function iconButton(classes: string[], title: string, icon: string, alt: string): TagElement<"button"> {
+export function iconButton(classes: string[], title: string, iconName: string, alt: string): TagElement<"button"> {
     classes.push('icon-button');
-    return button(classes, {title: title}, [
-        span(['icon', 'fas'], [icon]),
-        span(['alt'], [alt])
-    ]);
+    return button(classes, {title: title}, icon([], iconName, alt));
 }
 
 export function textbox(classes: string[], placeholder: string, value: string = "") {
@@ -123,7 +167,35 @@ export function textbox(classes: string[], placeholder: string, value: string = 
     if (value) {
         input.value = value;
     }
+    input.addEventListener('keydown', (evt: KeyboardEvent) => {
+        if (evt.key === 'Escape' || evt.key == 'Cancel') {
+            input.dispatchEvent(new CustomEvent('Cancel', { detail: { key: evt.key, event: evt }}));
+        } else if (evt.key === 'Enter' || evt.key === 'Accept') {
+            input.dispatchEvent(new CustomEvent('Accept', { detail: { key: evt.key, event: evt}}));
+        }
+    });
     return input;
+}
+
+export function textarea(classes: string[], placeholder: string, value: string =""): TagElement<"textarea"> {
+    const text = tag('textarea', classes, {placeholder: placeholder}, []);
+    if (value) {
+        text.value = value;
+    }
+
+    const adjustHeight = () => {
+        text.style.height = 'inherit'; // reset height first;
+        const p = (s: string | null) => parseInt(s || '0');
+        const s = window.getComputedStyle(text);
+        const h = text.scrollHeight + p(s.paddingBottom) + p(s.paddingTop) + p(s.borderBottomWidth) + p(s.borderTopWidth);
+        const ems = Math.floor(h / parseInt(s.fontSize));
+        text.style.height = `${ems}em`;
+    };
+
+    text.addEventListener('input', () => adjustHeight());
+    text.style.height = "3em"; // default height;
+
+    return text;
 }
 
 export interface DropdownElement extends TagElement<"select"> {
@@ -162,12 +234,20 @@ export function dropdown(classes: string[], options: Record<string, string>, val
 export function fakeSelectElem(classes: string[], buttons: TagElement<"button">[]) {
     classes.push("dropdown");
     return div(classes, [
-        div(['marker', 'fas'], [""]),
+        icon(['marker'], 'angle-down'),
     ].concat(buttons));
 }
 
 export function checkbox(classes: string[], label: string, value: boolean = false) {
     const attrs = {type:'checkbox', checked: value};
+    return tag('label', classes, {}, [
+        tag('input', [], attrs, []),
+        span([], [label])
+    ]);
+}
+
+export function radio(classes: string[], label: string, name: string, value: boolean = false) {
+    const attrs = {type:'radio', checked: value, name: name};
     return tag('label', classes, {}, [
         tag('input', [], attrs, []),
         span([], [label])
@@ -221,7 +301,7 @@ export interface TableElement extends TagElement<"table"> {
  */
 type TableRow = Record<string, Content>
 export function table(classes: string[], contentSpec: TableContentSpec): TableElement {
-    const colClass = (col: number) => contentSpec.classes ? contentSpec.classes[col] : '';
+    const colClass = (col: number) => contentSpec.classes?.[col] ?? '';
     const heading = contentSpec.header ? [tag('thead', [], {}, [
             tag('tr', [], {}, contentSpec.header.map((c, i) => tag('th', [colClass(i)], {}, [c])))
         ])] : [];
@@ -266,7 +346,7 @@ export function table(classes: string[], contentSpec: TableContentSpec): TableEl
 
     const body = tag(
         'tbody', [], {},
-        contentSpec.rows ? contentSpec.rows.map(mkTR) : []
+        contentSpec.rows?.map(mkTR) ?? []
     );
 
     const table = tag('table', classes, {}, [
@@ -275,7 +355,7 @@ export function table(classes: string[], contentSpec: TableContentSpec): TableEl
 
     return Object.assign(table, {
         addRow(row: Content[] | TableRow, whichBody?: TagElement<"tbody">) {
-            const tbody = whichBody === undefined ? body : whichBody;
+            const tbody = whichBody ?? body;
             const rowEl = mkTR(row);
             if (contentSpec.addToTop)
                 tbody.insertBefore(rowEl, tbody.firstChild);
@@ -307,7 +387,7 @@ export function table(classes: string[], contentSpec: TableContentSpec): TableEl
         addBody(rows?: TableRow[]) {
             const newBody = tag(
                 'tbody', [], {},
-                contentSpec.rows ? contentSpec.rows.map(mkTR) : []
+                contentSpec.rows?.map(mkTR) ?? []
             );
 
             table.appendChild(newBody);
@@ -326,4 +406,8 @@ export function details(classes: string[], summary: Content, content: Content) {
     ]);
     appendContent(el, content);
     return el;
+}
+
+export function polynoteLogo() {
+    return div(['polynote-logo'], [span(['alt'], ["Polynote"])]);
 }

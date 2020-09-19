@@ -1,5 +1,5 @@
 // GENERIFY (remove 'kernel' references?)
-import {Content, div, h3, h4, TagElement} from "../util/tags";
+import {Content, div, h3, h4, icon, TagElement} from "../util/tags";
 import {TaskStatus} from "../../data/messages";
 
 type KernelTask = TagElement<"div"> & {
@@ -30,6 +30,7 @@ export class KernelTasksUI {
 
     addTask(id: string, label: string, detail: Content, status: number, progress: number, parent?: string) {
         const taskEl: KernelTask = Object.assign(div(['task', (Object.keys(TaskStatus)[status] || 'unknown').toLowerCase()], [
+            icon(['close-button'], 'times', 'close icon').click(_ => this.removeTask(id)),
             h4([], [label]),
             div(['detail'], detail),
             div(['progress'], [div(['progress-bar'], [])]),
@@ -45,14 +46,13 @@ export class KernelTasksUI {
             taskEl.attr('title', detail);
         }
 
-        const container = parent ? (this.tasks[parent] && this.tasks[parent].querySelector('.child-tasks'))
-                                 : this.taskContainer;
+        const container = (parent && this.tasks[parent]?.querySelector('.child-tasks')) ?? this.taskContainer;
 
         if (container) {
             KernelTasksUI.setProgress(taskEl, progress);
 
             let before = container.firstChild as KernelTask;
-            while (before && before.status <= status) {
+            while (before?.status <= status) {
                 before = before.nextSibling as KernelTask;
             }
 
@@ -69,7 +69,7 @@ export class KernelTasksUI {
 
     taskStatus(id: string) {
         const task = this.tasks[id];
-        return task && task.status;
+        return task?.status;
     }
 
     updateTask(id: string, label: string, detail: Content, status: number, progress: number, parent?: string) {
@@ -100,13 +100,18 @@ export class KernelTasksUI {
                 task.classList.add(statusClass);
                 if (statusClass === "complete") {
                     setTimeout(() => {
-                        if (task.parentNode) task.parentNode.removeChild(task);
-                        delete this.tasks[id];
+                        this.removeTask(id)
                     }, 100);
                 }
             }
             task.status = status;
             KernelTasksUI.setProgress(task, progress);
         }
+    }
+
+    removeTask(id: string) {
+        const task = this.tasks[id];
+        if (task.parentNode) task.parentNode.removeChild(task);
+        delete this.tasks[id];
     }
 }

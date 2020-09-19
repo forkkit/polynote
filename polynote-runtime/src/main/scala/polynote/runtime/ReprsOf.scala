@@ -210,7 +210,7 @@ private[runtime] trait CollectionReprs extends FromDataReprs { self: ReprsOf.typ
     private def aggregate(col: String, aggName: String): Aggregator[_] = {
       def numericEncoder = enc.field(col) match {
         case Some((getter, colEnc)) if colEnc.numeric.nonEmpty =>
-          val numeric = colEnc.numeric.get.asInstanceOf[Any => Double]
+          val numeric = (colEnc.numeric.get.toDouble(_)).asInstanceOf[Any => Double]
           getter andThen numeric
         case Some(_) => throw new IllegalArgumentException(s"Field $col is not numeric; cannot compute $aggName")
         case None => throw new IllegalArgumentException(s"No field $col in struct")
@@ -236,26 +236,33 @@ private[runtime] trait CollectionReprs extends FromDataReprs { self: ReprsOf.typ
 
             val getters = groupingFields.map(_._1)
 
-            val aggregators = aggs.map {
-              case (col, aggName) => aggregate(col, aggName)
-            }
+            val (aggregateResultTypes, aggregateEncoders) = aggs.map {
+              case (col, aggName) =>
+                val a = aggregate(col, aggName)
+                (a.resultName -> a.encoder.dataType, a.encoder.asInstanceOf[DataEncoder[Any]])
+            }.unzip
 
             val groupTransform = (bs: Seq[B]) => bs.groupBy(b => getters.map(_.apply(b))).toSeq.map {
               case (groupCols, group) =>
+                val aggregators = aggs.map {
+                  case (col, aggName) => aggregate(col, aggName)
+                }
+
                 group.foreach {
                   b => aggregators.foreach {
                     agg => agg.accumulate(b)
                   }
                 }
+
                 val aggregates = aggregators.map(_.summarize())
                 (groupCols ::: aggregates).toArray
             }
 
             val groupedType = StructType(
-              (cols.zip(groupingFields.map(_._2.dataType)) ++ aggregators.map(agg => agg.resultName -> agg.encoder.dataType))
+              (cols.zip(groupingFields.map(_._2.dataType)) ++ aggregateResultTypes)
                 .map((StructField.apply _).tupled))
 
-            val groupedEncoders = groupingFields.map(_._2.asInstanceOf[DataEncoder[Any]]) ++ aggregators.map(_.encoder.asInstanceOf[DataEncoder[Any]])
+            val groupedEncoders = groupingFields.map(_._2.asInstanceOf[DataEncoder[Any]]) ++ aggregateEncoders
 
             val groupedEncoder = new runtime.DataEncoder.StructDataEncoder[Array[Any]](groupedType) {
               def field(name: String): Option[(Array[Any] => Any, DataEncoder[_])] = {

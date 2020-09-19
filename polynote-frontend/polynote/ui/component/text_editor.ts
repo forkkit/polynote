@@ -10,6 +10,30 @@ export class RichTextEditor {
 
         this.element.contentEditable = 'true';
 
+        // apparently FF already allows pasting images and getting a data URI.
+        // This emulates it for chrome. Inspiration from https://codecorner.galanter.net/2017/09/11/copypaste-image-into-an-editable-dom-element-in-chrome/
+        if ((window as any).chrome) {
+            this.element.addEventListener('paste', event => {
+                const items = event.clipboardData?.items;
+                if (items && items.length === 1 && items[0].kind === "file") {
+                    const item = items[0];
+                    const mimeParts = item.type.split('/');
+                    if (mimeParts[0] === "image") {
+                        const file = item.getAsFile();
+                        if (file) {
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                                const result = reader.result;
+                                document.execCommand('insertImage', false, result as string);
+                            };
+                            reader.readAsDataURL(file);
+                            event.preventDefault();
+                        }
+                    }
+                }
+            })
+        }
+
         this.element.addEventListener('keydown', (evt) => {
             if (evt.key === 'Tab') {
                 evt.preventDefault();
@@ -26,7 +50,7 @@ export class RichTextEditor {
                     const currentHeaderMatch = /^h([1-6])/.exec(blockType);
                     let currentHeader = 0;
                     let nextHeader = 1;
-                    if (currentHeaderMatch && currentHeaderMatch[1]) {
+                    if (currentHeaderMatch?.[1]) {
                         currentHeader = parseInt(currentHeaderMatch[1]);
                     }
                     if (currentHeader) {
